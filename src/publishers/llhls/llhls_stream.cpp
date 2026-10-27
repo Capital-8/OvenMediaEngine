@@ -1845,6 +1845,11 @@ bool LLHlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_pa
 	}
 
 	int64_t dts_us = static_cast<int64_t>(static_cast<double>(media_packet->GetDts()) * 1000000.0 * track->GetTimeBase().GetExpr());
+	if (_first_packet_timestamp_ms.has_value() == false)
+	{
+		_first_packet_timestamp_ms = static_cast<double>(dts_us) / 1000.0;
+	}
+
 	bool appended = true;
 	size_t stale_packet_count = 0;
 	for (const auto &packet : _keyframe_start_aligner->Push(media_packet, dts_us))
@@ -2555,7 +2560,11 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 
 		auto first_chunk_timestamp_ms = (static_cast<double>(partial_segment->GetStartTimestamp()) / GetTrack(track_id)->GetTimeBase().GetTimescale()) * 1000.0;
 
-		_wallclock_offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(GetInputStreamPublishedTime().time_since_epoch()).count() - first_chunk_timestamp_ms;
+		// The published time pairs with the first packet received; the first chunk
+		// starts later when the start alignment dropped the packets before a keyframe
+		auto anchor_timestamp_ms = _first_packet_timestamp_ms.value_or(first_chunk_timestamp_ms);
+
+		_wallclock_offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(GetInputStreamPublishedTime().time_since_epoch()).count() - anchor_timestamp_ms;
 
 		for (const auto &[track_id, chunklist] : _chunklist_map)
 		{

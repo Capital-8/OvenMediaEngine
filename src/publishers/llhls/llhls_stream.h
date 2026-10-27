@@ -343,6 +343,8 @@ private:
 	// PROGRAM-DATE-TIME
 	bool _first_chunk = true;
 	int64_t _wallclock_offset_ms = 0;
+	// DTS of the first packet received, which arrived at the published time
+	std::optional<double> _first_packet_timestamp_ms;
 
 	// ConcludeLive
 	// Append #EXT-X-ENDLIST all chunklists, and no more update segment and chunklist
