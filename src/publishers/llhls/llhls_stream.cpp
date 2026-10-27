@@ -1846,9 +1846,22 @@ bool LLHlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_pa
 
 	int64_t dts_us = static_cast<int64_t>(static_cast<double>(media_packet->GetDts()) * 1000000.0 * track->GetTimeBase().GetExpr());
 	bool appended = true;
+	size_t stale_packet_count = 0;
 	for (const auto &packet : _keyframe_start_aligner->Push(media_packet, dts_us))
 	{
+		// Held audio may predate a track change applied while it waited
+		if (IsStalePacket(packet))
+		{
+			stale_packet_count++;
+			continue;
+		}
+
 		appended = AppendToPackager(packet) && appended;
+	}
+
+	if (stale_packet_count > 0)
+	{
+		logti("%s Dropped %zu held packets of an older track version", GetName().CStr(), stale_packet_count);
 	}
 
 	if (_keyframe_start_aligner->IsAligned())
