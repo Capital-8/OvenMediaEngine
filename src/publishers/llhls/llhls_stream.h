@@ -24,6 +24,7 @@
 #include "modules/containers/webvtt/webvtt_packager.h"
 #include "llhls_master_playlist.h"
 #include "llhls_chunklist.h"
+#include "llhls_keyframe_start_aligner.h"
 
 // max initial media packet buffer size, for OOM protection
 #define MAX_INITIAL_MEDIA_PACKET_BUFFER_SIZE		10000
@@ -207,6 +208,7 @@ private:
 	ov::String GetNextPartialSegmentName(const int32_t &track_id, const int64_t &segment_number, const int64_t &partial_number, bool last_chunk) const;
 
 	bool AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_packet);
+	bool AppendToPackager(const std::shared_ptr<MediaPacket> &media_packet);
 
 	bool IsReadyToPlay() const;
 	bool CheckPlaylistReady();
@@ -359,6 +361,10 @@ private:
 	bool _vtt_enabled = false;
 	// Decided at Start() among the tracks that are actually packaged
 	int32_t _reference_track_id = -1;
+
+	// Created at Start() before any packet arrives; packets pass it only until
+	// every track has started, so a stream that joined mid-GOP starts on a keyframe
+	std::shared_ptr<LLHlsKeyframeStartAligner> _keyframe_start_aligner;
 
 	std::map<int32_t, std::shared_ptr<webvtt::Packager>> _vtt_packagers;
 	mutable std::shared_mutex _vtt_packagers_lock;

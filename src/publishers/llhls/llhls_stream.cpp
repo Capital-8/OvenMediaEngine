@@ -234,6 +234,7 @@ bool LLHlsStream::Start()
 	_reference_track_id = first_video_track ? first_video_track->GetId() : first_audio_track ? first_audio_track->GetId() : -1;
 
 	// Add packager for each track
+	std::vector<uint32_t> packaged_video_track_ids, packaged_audio_track_ids;
 	for (const auto &[id, track] : GetTracks())
 	{
 		if (IsSupportedMediaCodec(track->GetCodecId()) == true)
@@ -242,6 +243,15 @@ bool LLHlsStream::Start()
 			{
 				logte("LLHlsStream(%s/%s) - Failed to add packager for track(%u)", GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), track->GetId());
 				return false;
+			}
+
+			if (track->GetMediaType() == cmn::MediaType::Video)
+			{
+				packaged_video_track_ids.push_back(track->GetId());
+			}
+			else if (track->GetMediaType() == cmn::MediaType::Audio)
+			{
+				packaged_audio_track_ids.push_back(track->GetId());
 			}
 		}
 		else
@@ -255,6 +265,11 @@ bool LLHlsStream::Start()
 			continue;
 		}
 	}
+
+	int32_t reference_video_track_id = (first_video_track != nullptr) ? static_cast<int32_t>(first_video_track->GetId()) : -1;
+	_keyframe_start_aligner = std::make_shared<LLHlsKeyframeStartAligner>(reference_video_track_id, packaged_video_track_ids, packaged_audio_track_ids,
+																		   MAX_INITIAL_MEDIA_PACKET_BUFFER_SIZE,
+																		   ov::String::FormatString("LLHlsStream(%s/%s)", GetApplication()->GetVHostAppName().CStr(), GetName().CStr()));
 
 	// Set renditions to each chunklist writer
 	{
@@ -1824,11 +1839,33 @@ bool LLHlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_pa
 		return true;
 	}
 
-	// Get Packager
-	auto packager = GetPackager(track->GetId());
+	if (_keyframe_start_aligner == nullptr)
+	{
+		return AppendToPackager(media_packet);
+	}
+
+	int64_t dts_us = static_cast<int64_t>(static_cast<double>(media_packet->GetDts()) * 1000000.0 * track->GetTimeBase().GetExpr());
+	bool appended = true;
+	for (const auto &packet : _keyframe_start_aligner->Push(media_packet, dts_us))
+	{
+		appended = AppendToPackager(packet) && appended;
+	}
+
+	if (_keyframe_start_aligner->IsAligned())
+	{
+		// Every track has started; later packets go straight to the packagers
+		_keyframe_start_aligner.reset();
+	}
+
+	return appended;
+}
+
+bool LLHlsStream::AppendToPackager(const std::shared_ptr<MediaPacket> &media_packet)
+{
+	auto packager = GetPackager(media_packet->GetTrackId());
 	if (packager == nullptr)
 	{
-		logtw("Could not find packager. track id: %d", track->GetId());
+		logtw("Could not find packager. track id: %u", media_packet->GetTrackId());
 		return false;
 	}
 
