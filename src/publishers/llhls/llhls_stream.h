@@ -8,6 +8,7 @@
 //==============================================================================
 #pragma once
 
+#include <deque>
 #include <mutex>
 #include <optional>
 
@@ -370,6 +371,10 @@ private:
 
 	std::map<int32_t, std::shared_ptr<webvtt::Packager>> _vtt_packagers;
 	mutable std::shared_mutex _vtt_packagers_lock;
+
+	// Subtitle segments that left the playlists but stay servable, oldest first. Only the
+	// reference track's segment deletion touches it, which its storage serializes
+	std::deque<uint32_t> _vtt_retained_segment_numbers;
 
 	bool CreateOriginSessionPool();
 };
