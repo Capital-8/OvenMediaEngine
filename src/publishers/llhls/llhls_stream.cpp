@@ -234,6 +234,7 @@ bool LLHlsStream::Start()
 	_reference_track_id = first_video_track ? first_video_track->GetId() : first_audio_track ? first_audio_track->GetId() : -1;
 
 	// Add packager for each track
+	std::vector<uint32_t> packaged_video_track_ids, packaged_audio_track_ids;
 	for (const auto &[id, track] : GetTracks())
 	{
 		if (IsSupportedMediaCodec(track->GetCodecId()) == true)
@@ -242,6 +243,15 @@ bool LLHlsStream::Start()
 			{
 				logte("LLHlsStream(%s/%s) - Failed to add packager for track(%u)", GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), track->GetId());
 				return false;
+			}
+
+			if (track->GetMediaType() == cmn::MediaType::Video)
+			{
+				packaged_video_track_ids.push_back(track->GetId());
+			}
+			else if (track->GetMediaType() == cmn::MediaType::Audio)
+			{
+				packaged_audio_track_ids.push_back(track->GetId());
 			}
 		}
 		else
@@ -255,6 +265,11 @@ bool LLHlsStream::Start()
 			continue;
 		}
 	}
+
+	int32_t reference_video_track_id = (first_video_track != nullptr) ? static_cast<int32_t>(first_video_track->GetId()) : -1;
+	_keyframe_start_aligner = std::make_shared<LLHlsKeyframeStartAligner>(reference_video_track_id, packaged_video_track_ids, packaged_audio_track_ids,
+																		   MAX_INITIAL_MEDIA_PACKET_BUFFER_SIZE,
+																		   ov::String::FormatString("LLHlsStream(%s/%s)", GetApplication()->GetVHostAppName().CStr(), GetName().CStr()));
 
 	// Set renditions to each chunklist writer
 	{
@@ -1824,11 +1839,51 @@ bool LLHlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_pa
 		return true;
 	}
 
-	// Get Packager
-	auto packager = GetPackager(track->GetId());
+	if (_keyframe_start_aligner == nullptr)
+	{
+		return AppendToPackager(media_packet);
+	}
+
+	int64_t dts_us = static_cast<int64_t>(static_cast<double>(media_packet->GetDts()) * 1000000.0 * track->GetTimeBase().GetExpr());
+	if (_first_packet_timestamp_ms.has_value() == false)
+	{
+		_first_packet_timestamp_ms = static_cast<double>(dts_us) / 1000.0;
+	}
+
+	bool appended = true;
+	size_t stale_packet_count = 0;
+	for (const auto &packet : _keyframe_start_aligner->Push(media_packet, dts_us))
+	{
+		// Held audio may predate a track change applied while it waited
+		if (IsStalePacket(packet))
+		{
+			stale_packet_count++;
+			continue;
+		}
+
+		appended = AppendToPackager(packet) && appended;
+	}
+
+	if (stale_packet_count > 0)
+	{
+		logti("%s Dropped %zu held packets of an older track version", GetName().CStr(), stale_packet_count);
+	}
+
+	if (_keyframe_start_aligner->IsAligned())
+	{
+		// Every track has started; later packets go straight to the packagers
+		_keyframe_start_aligner.reset();
+	}
+
+	return appended;
+}
+
+bool LLHlsStream::AppendToPackager(const std::shared_ptr<MediaPacket> &media_packet)
+{
+	auto packager = GetPackager(media_packet->GetTrackId());
 	if (packager == nullptr)
 	{
-		logtw("Could not find packager. track id: %d", track->GetId());
+		logtw("Could not find packager. track id: %u", media_packet->GetTrackId());
 		return false;
 	}
 
@@ -2505,7 +2560,11 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 
 		auto first_chunk_timestamp_ms = (static_cast<double>(partial_segment->GetStartTimestamp()) / GetTrack(track_id)->GetTimeBase().GetTimescale()) * 1000.0;
 
-		_wallclock_offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(GetInputStreamPublishedTime().time_since_epoch()).count() - first_chunk_timestamp_ms;
+		// The published time pairs with the first packet received; the first chunk
+		// starts later when the start alignment dropped the packets before a keyframe
+		auto anchor_timestamp_ms = _first_packet_timestamp_ms.value_or(first_chunk_timestamp_ms);
+
+		_wallclock_offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(GetInputStreamPublishedTime().time_since_epoch()).count() - anchor_timestamp_ms;
 
 		for (const auto &[track_id, chunklist] : _chunklist_map)
 		{
