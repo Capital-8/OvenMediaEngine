@@ -10,6 +10,7 @@
 
 #include <base/publisher/session.h>
 #include <list>
+#include <optional>
 
 #include <modules/access_control/access_controller.h>
 
@@ -50,10 +51,13 @@ public:
 	void SendOutgoingData(const std::any &packet) override;
 	void OnMessageReceived(const std::any &message) override;
 
-	void UpdateLastRequest(uint32_t connection_id);
+	// Registers the connection, false once the session is closed
+	bool UpdateLastRequest(uint32_t connection_id);
 	uint64_t GetLastRequestTime(uint32_t connection_id) const;
-	void OnConnectionDisconnected(uint32_t connection_id);
-	bool IsNoConnection() const;
+	// Removes the connection. When it was the last one, returns the time the session became idle
+	std::optional<uint64_t> OnConnectionDisconnected(uint32_t connection_id);
+	// Closes the session if it has had no connection since idle_since, false when one came back meanwhile
+	bool CloseIfIdleSince(uint64_t idle_since);
 
 	// Get session key
 	const ov::String &GetSessionKey() const;
@@ -107,6 +111,9 @@ private:
 	// ID list of connections requesting this session
 	// Connection ID : last request time
 	std::map<uint32_t, uint64_t> _last_request_time;
+	// When the last connection left; a closed session takes no connection again
+	uint64_t _idle_since = 0;
+	bool _closed = false;
 	mutable std::shared_mutex _last_request_time_guard;
 	
 	// session life time

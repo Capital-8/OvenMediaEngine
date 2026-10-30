@@ -52,6 +52,15 @@ private:
 	bool OnDeletePublisherApplication(const std::shared_ptr<pub::Application> &application) override;
 	std::shared_ptr<LLHlsHttpInterceptor> CreateInterceptor();
 
+	// The open session this connection started with a request for the same URL
+	std::shared_ptr<LLHlsSession> FindSessionOpenedBy(const std::shared_ptr<http::svr::HttpConnection> &connection, const std::shared_ptr<const ov::Url> &requested_url);
+	// Closes the session once it has stayed without a connection for the grace period
+	void CloseSessionAfterGrace(const std::shared_ptr<LLHlsSession> &session, uint64_t idle_since, const std::shared_ptr<const ov::Socket> &last_socket);
+	void CloseSessionIfIdleSince(const std::shared_ptr<LLHlsSession> &session, uint64_t idle_since, const std::shared_ptr<const ov::Socket> &last_socket);
+
+	// Sessions are created and closed one at a time, so a URL can neither re-create a closing session nor take an id being issued
+	std::mutex _session_lifecycle_mutex;
+
 	std::mutex _http_server_list_mutex;
 	std::vector<std::shared_ptr<http::svr::HttpServer>> _http_server_list;
 	std::vector<std::shared_ptr<http::svr::HttpsServer>> _https_server_list;

@@ -214,7 +214,9 @@ namespace pub
 		std::atomic<StopCause> _stop_cause = StopCause::StreamDeleted;
 		std::shared_ptr<Application> _application;
 
-		session_id_t _last_issued_session_id;
+		// Shared by all streams, so a stream re-created under the same name does not hand out the ids
+		// its earlier players still carry
+		static std::atomic<session_id_t> _next_session_id;
 
 		std::chrono::system_clock::time_point _started_time;
 

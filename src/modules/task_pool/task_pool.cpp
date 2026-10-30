@@ -110,7 +110,50 @@ namespace ov
 		_rejected_count		  = 0;
 	}
 
-	bool TaskPool::Post(Task task)
+	bool TaskPool::StartWorkersOnFirstTask()
+	{
+		if (_workers.empty())
+		{
+			AddWorkers(_config.thread_count);
+		}
+
+		if (_workers.empty())
+		{
+			logte("No worker could be started, so the task is rejected");
+			return false;
+		}
+
+		return true;
+	}
+
+	bool TaskPool::CanAccept(Priority priority, std::optional<size_t> max_tasks)
+	{
+		if (_stopped)
+		{
+			return false;
+		}
+
+		if (StartWorkersOnFirstTask() == false)
+		{
+			return false;
+		}
+
+		const auto &queue = GetQueue(priority);
+		if (queue.ready.size() + queue.delayed.size() >= max_tasks.value_or(_config.max_tasks))
+		{
+			ReportRejection();
+			return false;
+		}
+
+		return true;
+	}
+
+	TaskPool::PriorityQueue &TaskPool::GetQueue(Priority priority)
+	{
+		return _queues[static_cast<size_t>(priority)];
+	}
+
+	bool TaskPool::Post(Task task, Priority priority, std::optional<size_t> max_tasks)
 	{
 		if (task == nullptr)
 		{
@@ -121,32 +164,39 @@ namespace ov
 		{
 			std::lock_guard<std::mutex> lock(_mutex);
 
-			if (_stopped)
+			if (CanAccept(priority, max_tasks) == false)
 			{
 				return false;
 			}
 
-			// Started lazily by the first task
-			if (_workers.empty())
-			{
-				AddWorkers(_config.thread_count);
-
-				if (_workers.empty())
-				{
-					logte("No worker could be started, so the task is rejected");
-					return false;
-				}
-			}
-
-			if (_task_queue.size() >= _config.max_tasks)
-			{
-				ReportRejection();
-				return false;
-			}
-
-			_task_queue.push(std::move(task));
+			GetQueue(priority).ready.push(std::move(task));
 		}
 
+		_condition.notify_one();
+
+		return true;
+	}
+
+	bool TaskPool::PostDelayed(int after_msec, Task task, Priority priority, std::optional<size_t> max_tasks)
+	{
+		if (task == nullptr)
+		{
+			OV_ASSERT2(task != nullptr);
+			return false;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+
+			if (CanAccept(priority, max_tasks) == false)
+			{
+				return false;
+			}
+
+			GetQueue(priority).delayed.emplace(std::chrono::steady_clock::now() + std::chrono::milliseconds(after_msec), std::move(task));
+		}
+
+		// A waiting worker takes up the earliest time again
 		_condition.notify_one();
 
 		return true;
@@ -227,7 +277,13 @@ namespace ov
 	{
 		std::lock_guard<std::mutex> lock(_mutex);
 
-		return _task_queue.size();
+		size_t count = 0;
+		for (const auto &queue : _queues)
+		{
+			count += queue.ready.size() + queue.delayed.size();
+		}
+
+		return count;
 	}
 
 	size_t TaskPool::GetThreadCount() const
@@ -274,8 +330,12 @@ namespace ov
 			_stopped = true;
 
 			// Dropped, not run; what they would touch may already be shutting down
-			std::queue<Task> empty_queue;
-			_task_queue.swap(empty_queue);
+			for (auto &queue : _queues)
+			{
+				std::queue<Task> empty_queue;
+				queue.ready.swap(empty_queue);
+				queue.delayed.clear();
+			}
 
 			for (auto &[name, worker] : _dedicated_workers)
 			{
@@ -363,6 +423,33 @@ namespace ov
 		}
 	}
 
+	std::optional<std::chrono::steady_clock::time_point> TaskPool::MoveDueTasks()
+	{
+		auto now = std::chrono::steady_clock::now();
+		std::optional<std::chrono::steady_clock::time_point> next_due;
+
+		for (auto &queue : _queues)
+		{
+			// Its time has come, so it lines up behind the tasks of its priority already waiting
+			while ((queue.delayed.empty() == false) && (queue.delayed.begin()->first <= now))
+			{
+				queue.ready.push(std::move(queue.delayed.begin()->second));
+				queue.delayed.erase(queue.delayed.begin());
+			}
+
+			if (queue.delayed.empty() == false)
+			{
+				auto due = queue.delayed.begin()->first;
+				if ((next_due.has_value() == false) || (due < next_due.value()))
+				{
+					next_due = due;
+				}
+			}
+		}
+
+		return next_due;
+	}
+
 	void TaskPool::WorkerThreadProc()
 	{
 		while (true)
@@ -372,17 +459,44 @@ namespace ov
 			{
 				std::unique_lock<std::mutex> lock(_mutex);
 
-				_condition.wait(lock, [this]() {
-					return _stopped || (_task_queue.empty() == false);
-				});
+				std::queue<Task> *ready_queue = nullptr;
+
+				while (_stopped == false)
+				{
+					auto next_due = MoveDueTasks();
+
+					// In priority order
+					for (auto &queue : _queues)
+					{
+						if (queue.ready.empty() == false)
+						{
+							ready_queue = &queue.ready;
+							break;
+						}
+					}
+
+					if (ready_queue != nullptr)
+					{
+						break;
+					}
+
+					if (next_due.has_value())
+					{
+						_condition.wait_until(lock, next_due.value());
+					}
+					else
+					{
+						_condition.wait(lock);
+					}
+				}
 
 				if (_stopped)
 				{
 					break;
 				}
 
-				task = std::move(_task_queue.front());
-				_task_queue.pop();
+				task = std::move(ready_queue->front());
+				ready_queue->pop();
 			}
 
 			// A task of one module must not be able to take down a worker the others share

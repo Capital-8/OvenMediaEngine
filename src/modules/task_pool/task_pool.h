@@ -10,13 +10,16 @@
 
 #include <base/ovlibrary/ovlibrary.h>
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 #include <type_traits>
@@ -36,11 +39,21 @@ namespace ov
 	public:
 		using Task = std::function<void()>;
 
+		// A worker takes normal tasks first, so a low task may wait behind them
+		enum class Priority
+		{
+			Normal,
+			Low
+		};
+
+		// A max_tasks that never rejects, for work that must not be dropped, such as closing a session
+		static constexpr size_t kNoLimit = std::numeric_limits<size_t>::max();
+
 		struct Config
 		{
 			// Sized for tasks that wait, not for the core count
 			size_t thread_count = 4;
-			// Tasks over this are rejected, not queued without end
+			// For a task posted without a max of its own; tasks over it are rejected, not queued without end
 			size_t max_tasks = 128;
 		};
 
@@ -53,8 +66,12 @@ namespace ov
 		// Applies a configuration directly; workers already running are not resized
 		void Configure(const Config &config);
 
-		// Runs the task on a shared worker. Returns false when stopped or the queue is full
-		bool Post(Task task);
+		// Runs the task on a shared worker. It is rejected when max_tasks tasks of its priority are
+		// already waiting, the configured max_tasks unless given. Returns false when stopped or rejected
+		bool Post(Task task, Priority priority = Priority::Normal, std::optional<size_t> max_tasks = std::nullopt);
+
+		// Same as Post(), but the task runs once after_msec has passed
+		bool PostDelayed(int after_msec, Task task, Priority priority = Priority::Normal, std::optional<size_t> max_tasks = std::nullopt);
 
 		// Runs the task on a dedicated worker named worker_name, tasks in posted order.
 		// Long-blocking work belongs here, off the shared workers. Callers using the same
@@ -100,10 +117,24 @@ namespace ov
 			bool running = false;
 		};
 
+		struct PriorityQueue
+		{
+			std::queue<Task> ready;
+			// Waiting for their time, earliest first; a due task joins ready
+			std::multimap<std::chrono::steady_clock::time_point, Task> delayed;
+		};
+
 		void WorkerThreadProc();
 		void DedicatedWorkerThreadProc(DedicatedWorker *worker);
 		// Returns how many started. The caller holds _mutex
 		size_t AddWorkers(size_t count);
+		// Starts the shared workers with the first task. Returns false when none could start. The caller holds _mutex
+		bool StartWorkersOnFirstTask();
+		// Returns false when the pool takes no task of this priority now. The caller holds _mutex
+		bool CanAccept(Priority priority, std::optional<size_t> max_tasks);
+		PriorityQueue &GetQueue(Priority priority);
+		// Moves the delayed tasks whose time has come to their ready queues and returns when the next one is due. The caller holds _mutex
+		std::optional<std::chrono::steady_clock::time_point> MoveDueTasks();
 		// Reports rejections at most once a second. The caller holds _mutex
 		void ReportRejection();
 
@@ -114,7 +145,8 @@ namespace ov
 		std::mutex _stop_mutex;
 
 		Config _config;
-		std::queue<Task> _task_queue;
+		// Indexed by Priority, taken in that order
+		std::array<PriorityQueue, 2> _queues;
 		std::vector<std::thread> _workers;
 
 		// The worker objects must outlive their threads, so Stop() joins before clearing

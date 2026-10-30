@@ -4,7 +4,7 @@
 //
 //  src/modules/task_pool/task_pool_test.cpp
 //  Covers: TaskPool (posting, results, worker isolation, queue limit, concurrent
-//          posting, stop, dedicated workers)
+//          posting, delayed tasks, priorities, stop, dedicated workers)
 //
 //==============================================================================
 #include <gtest/gtest.h>
@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 namespace
@@ -131,6 +132,86 @@ TEST(TaskPool, SubmitHandsBackTheResult)
 
 	ASSERT_EQ(future.wait_for(kWaitTimeout), std::future_status::ready);
 	EXPECT_STREQ(future.get().CStr(), "done");
+}
+
+TEST(TaskPool, RunsADelayedTaskOnceItsTimeHasCome)
+{
+	ov::TaskPool pool;
+	std::promise<void> promise;
+	auto future = promise.get_future();
+	auto posted_at = std::chrono::steady_clock::now();
+
+	ASSERT_TRUE(pool.PostDelayed(200, [&promise]() {
+		promise.set_value();
+	}));
+
+	EXPECT_EQ(future.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+	ASSERT_EQ(future.wait_for(kWaitTimeout), std::future_status::ready);
+	EXPECT_GE(std::chrono::steady_clock::now() - posted_at, std::chrono::milliseconds(200));
+}
+
+TEST(TaskPool, ADelayedTaskWaitsWithinTheQueueLimit)
+{
+	ov::TaskPool pool;
+	pool.Configure(MakeConfig(1, 2));
+
+	ASSERT_TRUE(pool.PostDelayed(1000, []() {}));
+	ASSERT_TRUE(pool.PostDelayed(1000, []() {}));
+	EXPECT_FALSE(pool.Post([]() {}));
+	EXPECT_EQ(pool.GetPendingCount(), 2u);
+}
+
+TEST(TaskPool, TakesTheMaxGivenWithATask)
+{
+	TaskGate gate;
+	ov::TaskPool pool;
+
+	pool.Configure(MakeConfig(1, 2));
+
+	// Nothing leaves the queue while the only worker is blocked
+	ASSERT_TRUE(OccupyWorkers(pool, gate, 1));
+
+	// Past the configured max
+	for (int index = 0; index < 5; index++)
+	{
+		ASSERT_TRUE(pool.PostDelayed(1000, []() {}, ov::TaskPool::Priority::Low, ov::TaskPool::kNoLimit));
+	}
+
+	// A max of its own decides, not the priority
+	EXPECT_FALSE(pool.Post([]() {}, ov::TaskPool::Priority::Low, 5));
+
+	// Tasks of another priority leave this room as it was
+	ASSERT_TRUE(pool.Post([]() {}));
+	ASSERT_TRUE(pool.Post([]() {}));
+	EXPECT_FALSE(pool.Post([]() {}));
+	EXPECT_EQ(pool.GetPendingCount(), 7u);
+
+	gate.Open();
+}
+
+TEST(TaskPool, RunsANormalTaskBeforeALowPriorityOne)
+{
+	TaskGate gate;
+	ov::TaskPool pool;
+
+	pool.Configure(MakeConfig(1, 8));
+
+	// Both wait behind the blocked worker, so only the priority decides the order
+	ASSERT_TRUE(OccupyWorkers(pool, gate, 1));
+
+	// On the heap because a task may outlive a failed wait
+	auto order = std::make_shared<std::vector<std::string>>();
+	auto done = std::make_shared<std::promise<void>>();
+	auto future = done->get_future();
+
+	ASSERT_TRUE(pool.Post([order]() { order->push_back("low"); }, ov::TaskPool::Priority::Low));
+	ASSERT_TRUE(pool.Post([order]() { order->push_back("normal"); }));
+	ASSERT_TRUE(pool.Post([done]() { done->set_value(); }, ov::TaskPool::Priority::Low));
+
+	gate.Open();
+
+	ASSERT_EQ(future.wait_for(kWaitTimeout), std::future_status::ready);
+	EXPECT_EQ(*order, (std::vector<std::string>{"normal", "low"}));
 }
 
 TEST(TaskPool, SubmitReportsAnExceptionThrownByTheTask)

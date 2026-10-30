@@ -52,7 +52,7 @@ namespace http
 			// Get Websocket Session
 			std::shared_ptr<ws::WebSocketSession> GetWebSocketSession() const;
 
-			// Get ID
+			// Unique for the process lifetime, unlike the socket fd that the kernel reuses right after close
 			uint32_t GetId() const;
 
 			// Get interceptor, return cached interceptor
@@ -91,6 +91,8 @@ namespace http
 			void InitializeHttp2Connection();
 
 			void CheckTimeout();
+
+			uint32_t _id = 0;
 
 			// User Data
 			std::any _user_data;

@@ -72,10 +72,7 @@ LLHlsSession::LLHlsSession(const info::Session &session_info,
 {
 	_origin_mode = origin_mode;
 	_session_life_time = session_life_time;
-	if (session_key.IsEmpty())
-	{
-		_session_key = ov::Random::GenerateString(8);
-	}
+	_session_key = session_key.IsEmpty() ? ov::Random::GenerateString(8) : session_key;
 
 	if (_origin_mode == true)
 	{
@@ -126,12 +123,19 @@ const ov::String &LLHlsSession::GetUserAgent() const
 	return _user_agent;
 }
 
-void LLHlsSession::UpdateLastRequest(uint32_t connection_id)
+bool LLHlsSession::UpdateLastRequest(uint32_t connection_id)
 {
 	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
+	if (_closed == true)
+	{
+		return false;
+	}
+
 	_last_request_time[connection_id] = ov::Clock::NowMSec();
 
 	logtt("LLHlsSession(%u) : Request updated from %u : size(%zu)", GetId(), connection_id, _last_request_time.size());
+
+	return true;
 }
 
 uint64_t LLHlsSession::GetLastRequestTime(uint32_t connection_id) const
@@ -146,19 +150,39 @@ uint64_t LLHlsSession::GetLastRequestTime(uint32_t connection_id) const
 	return itr->second;
 }
 
-void LLHlsSession::OnConnectionDisconnected(uint32_t connection_id)
+std::optional<uint64_t> LLHlsSession::OnConnectionDisconnected(uint32_t connection_id)
 {
-	// lock
 	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
-	_last_request_time.erase(connection_id);
+	// A connection that never used this session cannot close it
+	if (_last_request_time.erase(connection_id) == 0)
+	{
+		return std::nullopt;
+	}
 
 	logtt("LLHlsSession(%u) : Disconnected from %u : size(%zu)", GetId(), connection_id, _last_request_time.size());
+
+	if (_last_request_time.empty() == false)
+	{
+		return std::nullopt;
+	}
+
+	_idle_since = ov::Clock::NowMSec();
+
+	return _idle_since;
 }
 
-bool LLHlsSession::IsNoConnection() const
+bool LLHlsSession::CloseIfIdleSince(uint64_t idle_since)
 {
-	std::shared_lock<std::shared_mutex> lock(_last_request_time_guard);
-	return _last_request_time.empty();
+	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
+	// A connection that came back, or left again later, gives the session a grace period of its own
+	if (_closed || _last_request_time.empty() == false || _idle_since != idle_since)
+	{
+		return false;
+	}
+
+	_closed = true;
+
+	return true;
 }
 
 // pub::Session Interface
