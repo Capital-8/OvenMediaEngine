@@ -40,6 +40,10 @@ namespace bmff
 			uint64_t dvr_duration_sec = 0;
 		};
 
+		// Number of segments that stay servable after leaving the playlist, for a player
+		// that read the playlist just before
+		static constexpr uint32_t kSegmentRetentionCount = 3;
+
 		// boundary_policy decides where each segment ends
 		FMP4Storage(const std::shared_ptr<FMp4StorageObserver> &observer, const std::shared_ptr<const MediaTrack> &track, const Config &config, const ov::String &stream_tag, const std::shared_ptr<SegmentBoundaryPolicy> &boundary_policy);
 
@@ -137,7 +141,7 @@ namespace bmff
 				}
 			}; 
 
-			// Get total duration of all segments
+			// Get total duration of the segments in the window, excluding the retained ones
 			uint64_t GetTotalDurationMs() const
 			{
 				return _total_dvr_segment_duration_ms;
@@ -171,20 +175,44 @@ namespace bmff
 				_total_dvr_segment_duration_ms += duration_ms;
 			}
 
-			// Pop oldest segment info
-			SegmentInfo PopOldestSegmentInfo()
+			// Move the oldest segment in the window to the retention, out of the total
+			// duration but still found by GetSegmentInfo
+			SegmentInfo MoveOldestToRetention()
+			{
+				std::lock_guard<std::shared_mutex> lock(_segments_lock);
+
+				if (_retained_segment_count >= _segments.size())
+				{
+					return {0, 0, 0};
+				}
+
+				auto segment_info = _segments[_retained_segment_count];
+				_retained_segment_count++;
+				_total_dvr_segment_duration_ms -= segment_info.duration_ms;
+
+				return segment_info;
+			}
+
+			uint32_t GetRetainedSegmentCount() const
+			{
+				std::shared_lock<std::shared_mutex> lock(_segments_lock);
+				return _retained_segment_count;
+			}
+
+			// Pop oldest retained segment info
+			SegmentInfo PopOldestRetainedSegmentInfo()
 			{
 				//lock
 				std::lock_guard<std::shared_mutex> lock(_segments_lock);
 
-				if(_segments.empty())
+				if (_retained_segment_count == 0)
 				{
 					return {0, 0, 0};
 				}
 
 				auto segment_info = _segments.front();
 				_segments.pop_front();
-				_total_dvr_segment_duration_ms -= segment_info.duration_ms;
+				_retained_segment_count--;
 
 				// update first segment number
 				_first_segment_number += 1;
@@ -223,6 +251,8 @@ namespace bmff
 			// segments lock
 			mutable std::shared_mutex _segments_lock;
 			uint32_t _first_segment_number = 0;
+			// Segments at the front that left the window but keep their files
+			uint32_t _retained_segment_count = 0;
 			double _total_dvr_segment_duration_ms = 0;
 		};
 

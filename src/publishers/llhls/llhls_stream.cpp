@@ -2771,6 +2771,15 @@ void LLHlsStream::OnMediaSegmentDeleted(const int32_t &track_id, const uint32_t 
 
 	if (IsVttEnabled() && track_id == _reference_track_id)
 	{
+		// Subtitle segments stay servable as long as the reference track's segments
+		std::optional<uint32_t> vtt_segment_number_to_delete;
+		_vtt_retained_segment_numbers.push_back(segment_number);
+		if (_vtt_retained_segment_numbers.size() > bmff::FMP4Storage::kSegmentRetentionCount)
+		{
+			vtt_segment_number_to_delete = _vtt_retained_segment_numbers.front();
+			_vtt_retained_segment_numbers.pop_front();
+		}
+
 		std::shared_lock<std::shared_mutex> vtt_packagers_lock(_vtt_packagers_lock);
 		// If this is a VTT reference track, we need to delete a chunklist for vtt chunklists as well
 		for (const auto &it : _vtt_packagers)
@@ -2785,7 +2794,10 @@ void LLHlsStream::OnMediaSegmentDeleted(const int32_t &track_id, const uint32_t 
 			}
 
 			vtt_playlist->RemoveSegmentInfo(segment_number);
-			vtt_packager->DeleteSegment(segment_number);
+			if (vtt_segment_number_to_delete.has_value() == true)
+			{
+				vtt_packager->DeleteSegment(vtt_segment_number_to_delete.value());
+			}
 		}
 	}
 

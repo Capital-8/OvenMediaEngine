@@ -434,10 +434,25 @@ namespace bmff
 
 		_dvr_info.AppendSegment(segment->GetNumber(), segment->GetDurationMs(), segment->GetDataLength());
 
-		// Delete old segments until the total duration is less than the maximum DVR duration
+		// Remove old segments from the playlist until the total duration fits in the maximum DVR duration
 		while (_dvr_info.GetTotalDurationMs() > (_config.dvr_duration_sec * 1000.0))
 		{
-			auto segment_to_delete = _dvr_info.PopOldestSegmentInfo();
+			auto segment_to_retain = _dvr_info.MoveOldestToRetention();
+			if (segment_to_retain.IsAvailable() == false)
+			{
+				break;
+			}
+
+			if (_observer != nullptr)
+			{
+				_observer->OnMediaSegmentDeleted(GetTrack()->GetId(), segment_to_retain.segment_number);
+			}
+		}
+
+		// The player may request a segment that just left the playlist, so its file is deleted a bit late
+		while (_dvr_info.GetRetainedSegmentCount() > kSegmentRetentionCount)
+		{
+			auto segment_to_delete = _dvr_info.PopOldestRetainedSegmentInfo();
 			if (segment_to_delete.IsAvailable() == false)
 			{
 				break;
@@ -447,11 +462,6 @@ namespace bmff
 			if (std::remove(file_path) != 0)
 			{
 				logte("Could not delete DVR segment file: %s", file_path.CStr());
-			}
-
-			if (_observer != nullptr)
-			{
-				_observer->OnMediaSegmentDeleted(GetTrack()->GetId(), segment_to_delete.segment_number);
 			}
 		}
 
@@ -535,7 +545,7 @@ namespace bmff
 				auto old_segment = old_it->second;
 
 				// Since the chunklist is updated late, the player may request deleted segments in the meantime, so it actually deletes them a bit late.
-				if (_segments.size() > _config.max_segments + 3)
+				if (_segments.size() > _config.max_segments + kSegmentRetentionCount)
 				{
 					_segments.erase(_segments.begin());
 					DropUnreferencedInitializationSections();
