@@ -11,15 +11,17 @@ namespace http
 	{
 		HttpConnection::HttpConnection(const std::shared_ptr<HttpServer> &server, const std::shared_ptr<ov::ClientSocket> &client_socket)
 		{
+			static std::atomic<uint32_t> last_id = 0;
+
+			_id = ++last_id;
 			_server = server;
 			_client_socket = client_socket;
 			_connection_type = ConnectionType::Http11; // Default to HTTP/1.1
 		}
 
-		// Get Id from socket
 		uint32_t HttpConnection::GetId() const
 		{
-			return _client_socket->GetNativeHandle();
+			return _id;
 		}
 
 		void HttpConnection::SetUserData(std::any user_data)

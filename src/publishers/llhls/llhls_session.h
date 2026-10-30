@@ -10,6 +10,7 @@
 
 #include <base/publisher/session.h>
 #include <list>
+#include <optional>
 
 #include <modules/access_control/access_controller.h>
 
@@ -20,14 +21,14 @@ class LLHlsSession : public pub::Session
 public:
 	static std::shared_ptr<LLHlsSession> Create(session_id_t session_id, 
 												const bool &origin_mode,
-												const ov::String &session_key, 
+												const ov::String &session_value, 
 												const std::shared_ptr<pub::Application> &application,
 												const std::shared_ptr<pub::Stream> &stream,
 												uint64_t session_life_time);
 
 	static std::shared_ptr<LLHlsSession> Create(session_id_t session_id, 
 												const bool &origin_mode,
-												const ov::String &session_key, 
+												const ov::String &session_value, 
 												const std::shared_ptr<pub::Application> &application,
 												const std::shared_ptr<pub::Stream> &stream,
 												const ov::String &user_agent,
@@ -35,7 +36,7 @@ public:
 
 	LLHlsSession(const info::Session &session_info, 
 				const bool &origin_mode,
-				const ov::String &session_key,
+				const ov::String &session_value,
 				const std::shared_ptr<pub::Application> &application, 
 				const std::shared_ptr<pub::Stream> &stream,
 				const ov::String &user_agent,
@@ -50,13 +51,18 @@ public:
 	void SendOutgoingData(const std::any &packet) override;
 	void OnMessageReceived(const std::any &message) override;
 
-	void UpdateLastRequest(uint32_t connection_id);
+	// Registers the connection, false once the session is closed
+	bool UpdateLastRequest(uint32_t connection_id);
 	uint64_t GetLastRequestTime(uint32_t connection_id) const;
-	void OnConnectionDisconnected(uint32_t connection_id);
-	bool IsNoConnection() const;
+	// Removes the connection. When it was the last one, returns the time the session became idle
+	std::optional<uint64_t> OnConnectionDisconnected(uint32_t connection_id);
+	// Closes the session if it has had no connection since idle_since, false when one came back meanwhile
+	bool CloseIfIdleSince(uint64_t idle_since);
 
-	// Get session key
-	const ov::String &GetSessionKey() const;
+	// The session value its players carry in their URLs
+	const ov::String &GetSessionValue() const;
+	// Whether the value has the form OME issues, so it is safe to write back into a playlist
+	static bool IsSessionValue(const ov::String &value);
 
 	const ov::String &GetUserAgent() const;
 
@@ -107,13 +113,17 @@ private:
 	// ID list of connections requesting this session
 	// Connection ID : last request time
 	std::map<uint32_t, uint64_t> _last_request_time;
+	// When the last connection left; a closed session takes no connection again
+	uint64_t _idle_since = 0;
+	bool _closed = false;
 	mutable std::shared_mutex _last_request_time_guard;
 	
 	// session life time
 	uint64_t _session_life_time = 0;
 	uint32_t _number_of_players = 0;
 
-	ov::String _session_key;
+	// <session id>_<key> unless the session was started by a value from a URL
+	ov::String _session_value;
 
 	int _master_playlist_max_age = 0;
 	int _chunklist_max_age = 0;

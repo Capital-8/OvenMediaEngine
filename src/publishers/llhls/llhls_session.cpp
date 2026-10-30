@@ -34,24 +34,24 @@ static void LLHlsTraceLog(char stage, uint32_t session_id, const char *file, int
 
 std::shared_ptr<LLHlsSession> LLHlsSession::Create(session_id_t session_id, 
 												const bool &origin_mode,
-												const ov::String &session_key,
+												const ov::String &session_value,
 												const std::shared_ptr<pub::Application> &application,
 												const std::shared_ptr<pub::Stream> &stream,
 												uint64_t session_life_time)
 {
-	return LLHlsSession::Create(session_id, origin_mode, session_key, application, stream, nullptr, session_life_time);
+	return LLHlsSession::Create(session_id, origin_mode, session_value, application, stream, nullptr, session_life_time);
 }
 
 std::shared_ptr<LLHlsSession> LLHlsSession::Create(session_id_t session_id, 
 												const bool &origin_mode,
-												const ov::String &session_key,
+												const ov::String &session_value,
 												const std::shared_ptr<pub::Application> &application,
 												const std::shared_ptr<pub::Stream> &stream,
 												const ov::String &user_agent,
 												uint64_t session_life_time)
 {
 	auto session_info = info::Session(*std::static_pointer_cast<info::Stream>(stream), session_id);
-	auto session = std::make_shared<LLHlsSession>(session_info, origin_mode, session_key, application, stream, user_agent, session_life_time);
+	auto session = std::make_shared<LLHlsSession>(session_info, origin_mode, session_value, application, stream, user_agent, session_life_time);
 
 	if (session->Start() == false)
 	{
@@ -63,7 +63,7 @@ std::shared_ptr<LLHlsSession> LLHlsSession::Create(session_id_t session_id,
 
 LLHlsSession::LLHlsSession(const info::Session &session_info, 
 							const bool &origin_mode,
-							const ov::String &session_key,
+							const ov::String &session_value,
 							const std::shared_ptr<pub::Application> &application, 
 							const std::shared_ptr<pub::Stream> &stream,
 							const ov::String &user_agent,
@@ -72,10 +72,7 @@ LLHlsSession::LLHlsSession(const info::Session &session_info,
 {
 	_origin_mode = origin_mode;
 	_session_life_time = session_life_time;
-	if (session_key.IsEmpty())
-	{
-		_session_key = ov::Random::GenerateString(8);
-	}
+	_session_value = session_value.IsEmpty() ? ov::String::FormatString("%u_%s", session_info.GetId(), ov::Random::GenerateString(kSessionKeyLength).CStr()) : session_value;
 
 	if (_origin_mode == true)
 	{
@@ -116,9 +113,36 @@ bool LLHlsSession::Stop()
 	return Session::Stop();
 }
 
-const ov::String &LLHlsSession::GetSessionKey() const
+const ov::String &LLHlsSession::GetSessionValue() const
 {
-	return _session_key;
+	return _session_value;
+}
+
+bool LLHlsSession::IsSessionValue(const ov::String &value)
+{
+	auto tokens = value.Split("_");
+	if ((tokens.size() != 2) || tokens[0].IsEmpty() || (tokens[1].GetLength() != kSessionKeyLength))
+	{
+		return false;
+	}
+
+	for (size_t index = 0; index < tokens[0].GetLength(); index++)
+	{
+		if (std::isdigit(static_cast<unsigned char>(tokens[0][index])) == 0)
+		{
+			return false;
+		}
+	}
+
+	for (size_t index = 0; index < tokens[1].GetLength(); index++)
+	{
+		if (std::isalnum(static_cast<unsigned char>(tokens[1][index])) == 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 const ov::String &LLHlsSession::GetUserAgent() const
@@ -126,12 +150,19 @@ const ov::String &LLHlsSession::GetUserAgent() const
 	return _user_agent;
 }
 
-void LLHlsSession::UpdateLastRequest(uint32_t connection_id)
+bool LLHlsSession::UpdateLastRequest(uint32_t connection_id)
 {
 	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
+	if (_closed == true)
+	{
+		return false;
+	}
+
 	_last_request_time[connection_id] = ov::Clock::NowMSec();
 
 	logtt("LLHlsSession(%u) : Request updated from %u : size(%zu)", GetId(), connection_id, _last_request_time.size());
+
+	return true;
 }
 
 uint64_t LLHlsSession::GetLastRequestTime(uint32_t connection_id) const
@@ -146,19 +177,39 @@ uint64_t LLHlsSession::GetLastRequestTime(uint32_t connection_id) const
 	return itr->second;
 }
 
-void LLHlsSession::OnConnectionDisconnected(uint32_t connection_id)
+std::optional<uint64_t> LLHlsSession::OnConnectionDisconnected(uint32_t connection_id)
 {
-	// lock
 	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
-	_last_request_time.erase(connection_id);
+	// A connection that never used this session cannot close it
+	if (_last_request_time.erase(connection_id) == 0)
+	{
+		return std::nullopt;
+	}
 
 	logtt("LLHlsSession(%u) : Disconnected from %u : size(%zu)", GetId(), connection_id, _last_request_time.size());
+
+	if (_last_request_time.empty() == false)
+	{
+		return std::nullopt;
+	}
+
+	_idle_since = ov::Clock::NowMSec();
+
+	return _idle_since;
 }
 
-bool LLHlsSession::IsNoConnection() const
+bool LLHlsSession::CloseIfIdleSince(uint64_t idle_since)
 {
-	std::shared_lock<std::shared_mutex> lock(_last_request_time_guard);
-	return _last_request_time.empty();
+	std::lock_guard<std::shared_mutex> lock(_last_request_time_guard);
+	// A connection that came back, or left again later, gives the session a grace period of its own
+	if (_closed || _last_request_time.empty() == false || _idle_since != idle_since)
+	{
+		return false;
+	}
+
+	_closed = true;
+
+	return true;
 }
 
 // pub::Session Interface
@@ -962,7 +1013,7 @@ bool LLHlsSession::AddPendingRequest(const std::shared_ptr<http::svr::HttpExchan
 
 ov::String LLHlsSession::MakeQueryStringToPropagate(const std::shared_ptr<ov::Url> &request_uri)
 {
-	auto query_string = ov::String::FormatString("session=%u_%s", GetId(), _session_key.CStr());
+	auto query_string = ov::String::FormatString("session=%s", _session_value.CStr());
 	if (_origin_mode == true)
 	{
 		// Origin mode doesn't need session key
@@ -983,7 +1034,8 @@ ov::String LLHlsSession::MakeQueryStringToPropagate(const std::shared_ptr<ov::Ur
 			query_string += "&";
 		}
 
-		query_string.AppendFormat("stream_key=%s", stream_key.CStr());
+		// Written back into playlists, so it goes out encoded rather than as it was decoded
+		query_string.AppendFormat("stream_key=%s", ov::Url::Encode(stream_key).CStr());
 	}
 
 	return query_string;

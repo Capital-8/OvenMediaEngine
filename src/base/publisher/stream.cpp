@@ -200,7 +200,6 @@ namespace pub
 		: info::Stream(info)
 	{
 		_application = application;
-		_last_issued_session_id = 100;
 		_state = State::CREATED;
 	}
 
@@ -667,23 +666,19 @@ namespace pub
 		return true;
 	}
 
+	std::atomic<session_id_t> Stream::_next_session_id = 100;
+
 	uint32_t Stream::IssueUniqueSessionId()
 	{
-		auto new_session_id = _last_issued_session_id++;
+		std::shared_lock<std::shared_mutex> lock(_session_map_mutex);
 
-		while (true)
+		// Once the counter wraps around, a session that has lived through it may still hold the next id
+		auto session_id = _next_session_id++;
+		while (_sessions.find(session_id) != _sessions.end())
 		{
-			if (_sessions.find(new_session_id) == _sessions.end())
-			{
-				// not found
-				break;
-			}
-
-			new_session_id++;
+			session_id = _next_session_id++;
 		}
 
-		_last_issued_session_id = new_session_id;
-
-		return new_session_id;
+		return session_id;
 	}
 }  // namespace pub
